@@ -25,6 +25,12 @@ def compute_mota_motp(gt_positions: np.ndarray, gt_ids: np.ndarray,
         motp: MOTP score
         stats: Dictionary with detailed statistics
     """
+    # Ensure arrays are at least 1-dimensional
+    gt_positions = np.atleast_2d(gt_positions)
+    gt_ids = np.atleast_1d(gt_ids)
+    pred_positions = np.atleast_2d(pred_positions)
+    pred_ids = np.atleast_1d(pred_ids)
+
     if len(gt_positions) == 0:
         if len(pred_positions) == 0:
             return 1.0, 0.0, {'FP': 0, 'FN': 0, 'IDSW': 0, 'matches': 0, 'num_gt': 0, 'num_pred': 0}

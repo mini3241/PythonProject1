@@ -19,11 +19,12 @@ class FusionState(IntEnum):
 
 @dataclass
 class Detection:
-    """Detection result data class."""
+    """检测结果，包含置信度用于自适应卡尔曼噪声。"""
     center: Tuple[float, float]
     confidence: float
     feature: Optional[np.ndarray] = None
     fusion_state: FusionState = FusionState.RADAR_ONLY
+    voxel_confidence: float = 1.0  # 体素融合置信度，用于公式8/9
 
 
 class KalmanFilterFusion:
@@ -77,10 +78,25 @@ class KalmanFilterFusion:
         self.covariance = self._motion_mat @ self.covariance @ self._motion_mat.T + self.Q
         return self.mean.flatten(), self.covariance
 
-    def update(self, measurement):
+    def update(self, measurement, confidence=1.0, gamma=5.0):
+        """
+        卡尔曼滤波更新，支持自适应噪声（论文公式8/9）。
+        R_t = γ · (1 - C_track) · I_cov
+        置信度低时增大观测噪声，更依赖预测；置信度高时减小噪声，更信任观测。
+        Args:
+            measurement: [x, y, theta] 观测值
+            confidence: C_track 融合置信度 [0, 1]
+            gamma: 缩放因子
+        """
         z = np.array(measurement, dtype=np.float32).reshape(self.dim_z, 1)
+
+        # 自适应观测噪声（论文公式9）
+        adaptive_R = gamma * (1.0 - confidence) * np.eye(self.dim_z, dtype=np.float32)
+        # 加上基础噪声避免R为零
+        R_used = self.R + adaptive_R
+
         PHT = self.covariance @ self.H.T
-        S = self.H @ PHT + self.R
+        S = self.H @ PHT + R_used
         K = PHT @ np.linalg.inv(S)
         innovation = z - self.H @ self.mean
         self.mean = self.mean + K @ innovation
@@ -152,8 +168,9 @@ class KalmanTrack:
         self.age += 1
         self.time_since_update += 1
 
-    def update(self, x, y, feature=None, fusion_state=FusionState.RADAR_ONLY):
-        self.mean, self.covariance = self.kf.update([x, y, 0.0])
+    def update(self, x, y, feature=None, fusion_state=FusionState.RADAR_ONLY,
+               confidence=1.0):
+        self.mean, self.covariance = self.kf.update([x, y, 0.0], confidence=confidence)
         self.hits += 1
         self.time_since_update = 0
 
@@ -312,11 +329,15 @@ class SequenceMOTATracker:
                 x, y = det.center[0], det.center[1]
                 feature = det.feature if np.any(det.feature) else None
                 fusion_state = det.fusion_state
+                conf = det.voxel_confidence
             else:
                 x, y = det[0], det[1]
                 feature = None
                 fusion_state = FusionState.RADAR_ONLY
-            self.tracks[track_idx].update(x, y, feature=feature, fusion_state=fusion_state)
+                conf = 1.0
+            self.tracks[track_idx].update(
+                x, y, feature=feature, fusion_state=fusion_state, confidence=conf
+            )
 
         for track_idx in unmatched_tracks:
             self.tracks[track_idx].mark_missed()

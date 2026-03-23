@@ -1,17 +1,25 @@
 """
-Evaluation script for radar-camera fusion model.
-Preserves original evaluation logic.
+评估脚本（v3架构）- 支持时序累积TCA和自适应卡尔曼跟踪。
+输出 per-frame MOTA 和 tracker-based MOTA。
 """
 
 import os
 import sys
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 
-# Add parent directory to path
 sys.path.insert(0, '/mnt/ChillDisk/personal_data/mij/pythonProject1')
+
+
+def nms_heatmap(heatmap, kernel_size=3):
+    """热图NMS：只保留局部最大值。"""
+    pad = (kernel_size - 1) // 2
+    hmax = F.max_pool2d(heatmap, kernel_size, stride=1, padding=pad)
+    keep = (hmax == heatmap).float()
+    return heatmap * keep
 
 from radar_camera_fusion_v3.config.base import BaseConfig
 from radar_camera_fusion_v3.models.base_model import RadarCameraFusionModel
@@ -21,106 +29,132 @@ from radar_camera_fusion_v3.utils.metrics import compute_mota_motp, accumulate_m
 
 
 class Evaluator:
-    """Evaluation pipeline for radar-camera fusion."""
+    """评估管线 - 支持所有论文模块。"""
 
     def __init__(self, config: BaseConfig, checkpoint_path: str):
         self.config = config
         self.device = torch.device(config.device if torch.cuda.is_available() else 'cpu')
 
-        # Create model
         self.model = RadarCameraFusionModel(config).to(self.device)
 
-        # Load checkpoint
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"Loaded checkpoint from {checkpoint_path}")
+            # 灵活加载（兼容新旧模型）
+            model_dict = self.model.state_dict()
+            pretrained = {k: v for k, v in checkpoint['model_state_dict'].items()
+                         if k in model_dict and v.shape == model_dict[k].shape}
+            model_dict.update(pretrained)
+            self.model.load_state_dict(model_dict)
+            print(f"加载checkpoint: {checkpoint_path} ({len(pretrained)}/{len(model_dict)} 参数)")
+            if 'epoch' in checkpoint:
+                print(f"  Epoch: {checkpoint['epoch']}")
         else:
-            print(f"Warning: Checkpoint not found at {checkpoint_path}")
+            print(f"警告: checkpoint未找到 {checkpoint_path}")
 
         self.model.eval()
 
-        # Create dataset
         valid_list = os.path.join(os.path.dirname(config.mapping_csv), 'valid.txt')
         self.valid_dataset = RadarCameraDataset(config, valid_list, is_train=False)
-
         self.valid_loader = DataLoader(
-            self.valid_dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-            collate_fn=custom_collate_fn
+            self.valid_dataset, batch_size=1, shuffle=False,
+            num_workers=config.num_workers, collate_fn=custom_collate_fn
         )
 
-        # Tracker
-        self.tracker = SequenceMOTATracker()
-
-        print(f"Initialized evaluator with {len(self.valid_dataset)} validation samples")
+        self.det_threshold = 0.3
+        print(f"评估器初始化: {len(self.valid_dataset)} 验证样本, 检测阈值: {self.det_threshold}")
 
     def _extract_detections(self, outputs):
-        """Extract detections from model outputs."""
+        """提取检测结果（含置信度，用于自适应卡尔曼噪声）。"""
         detections = []
 
-        if 'detection_map' in outputs:
-            detection_map = torch.sigmoid(outputs['detection_map'][0, 0]).cpu().numpy()
+        if 'detection_map' not in outputs:
+            return detections
 
-            # Simple peak detection
-            threshold = 0.5
-            peaks = np.where(detection_map > threshold)
+        raw_heatmap = outputs['detection_map']
+        heatmap_sig = torch.sigmoid(raw_heatmap)
+        heatmap_nms = nms_heatmap(heatmap_sig, kernel_size=5)
+        detection_map = heatmap_nms[0, 0].cpu().numpy()
 
-            for y, x in zip(peaks[0], peaks[1]):
-                # Convert grid to world coordinates
-                world_x = (x / self.config.bev_width *
-                          (self.config.bev_x_range[1] - self.config.bev_x_range[0]) +
-                          self.config.bev_x_range[0])
-                world_y = (y / self.config.bev_height *
-                          (self.config.bev_y_range[1] - self.config.bev_y_range[0]) +
-                          self.config.bev_y_range[0])
+        # 获取融合置信度图（如果有TCA累积的置信度）
+        fused_conf = outputs.get('fused_confidence', None)
+        if fused_conf is not None:
+            conf_map = fused_conf[0, 0].cpu().numpy()
+        else:
+            conf_map = None
 
-                detections.append(Detection(
-                    center=(world_x, world_y),
-                    confidence=detection_map[y, x],
-                    fusion_state=FusionState.FUSED
-                ))
+        peaks = np.where(detection_map > self.det_threshold)
+
+        for y, x in zip(peaks[0], peaks[1]):
+            world_x = (x / self.config.bev_width *
+                      (self.config.bev_x_range[1] - self.config.bev_x_range[0]) +
+                      self.config.bev_x_range[0])
+            world_y = (y / self.config.bev_height *
+                      (self.config.bev_y_range[1] - self.config.bev_y_range[0]) +
+                      self.config.bev_y_range[0])
+
+            # 体素置信度（论文公式8/9）
+            voxel_conf = conf_map[y, x] if conf_map is not None else float(detection_map[y, x])
+
+            detections.append(Detection(
+                center=(world_x, world_y),
+                confidence=float(detection_map[y, x]),
+                fusion_state=FusionState.FUSED,
+                voxel_confidence=float(voxel_conf)
+            ))
 
         return detections
 
     def evaluate(self):
-        """Run evaluation on validation set."""
-        all_stats = []
+        """运行完整评估。"""
+        perframe_stats = []
+        tracker_stats = []
 
-        # Reset tracker
-        self.tracker = SequenceMOTATracker()
+        tracker = SequenceMOTATracker()
+        prev_scene = None
 
         with torch.no_grad():
-            pbar = tqdm(self.valid_loader, desc="Evaluating")
+            pbar = tqdm(self.valid_loader, desc="评估中")
             for batch_idx, batch in enumerate(pbar):
                 images = batch['images'].to(self.device)
-
-                # Handle radar_points - can be tensor or list
                 radar_points = batch['radar_points']
                 if isinstance(radar_points, list):
                     radar_points = [rp.to(self.device) for rp in radar_points]
                 else:
                     radar_points = radar_points.to(self.device)
 
-                # Skip batches with empty ground truth
-                if len(batch['gt_positions']) == 0 or batch['gt_positions'][0].size(0) == 0:
-                    continue
+                gt_pos_raw = batch['gt_positions']
+                gt_ids_raw = batch['gt_ids']
+                if isinstance(gt_pos_raw, list):
+                    if len(gt_pos_raw) == 0 or gt_pos_raw[0].size(0) == 0:
+                        continue
+                    gt_positions = gt_pos_raw[0].cpu().numpy()
+                    gt_ids = gt_ids_raw[0].cpu().numpy()
+                else:
+                    if gt_pos_raw.size(0) == 0:
+                        continue
+                    gt_positions = gt_pos_raw.cpu().numpy()
+                    gt_ids = gt_ids_raw.cpu().numpy()
 
-                gt_positions = batch['gt_positions'][0].cpu().numpy()
-                gt_ids = batch['gt_ids'][0].cpu().numpy()
-                scene_name = batch['scene_name']
+                if gt_positions.ndim == 1:
+                    gt_positions = gt_positions.reshape(1, -1)
+
+                scene_name = batch.get('scene_name', None)
+
+                # 场景切换时重置tracker和时序缓存
+                if scene_name is not None:
+                    curr_scene = scene_name[0] if isinstance(scene_name, (list, tuple)) else scene_name
+                    if curr_scene != prev_scene:
+                        tracker = SequenceMOTATracker()
+                        self.model.reset_temporal()
+                        prev_scene = curr_scene
 
                 intrinsic_matrix = batch.get('intrinsic_matrix')
                 if intrinsic_matrix is not None:
                     intrinsic_matrix = intrinsic_matrix.to(self.device)
-
                 lidar_to_camera_extrinsic = batch.get('lidar_to_camera_extrinsic')
                 if lidar_to_camera_extrinsic is not None:
                     lidar_to_camera_extrinsic = lidar_to_camera_extrinsic.to(self.device)
 
-                # Forward pass
                 model_input = {
                     'images': images,
                     'radar_points': radar_points
@@ -131,61 +165,80 @@ class Evaluator:
                     model_input['lidar_to_camera_extrinsic'] = lidar_to_camera_extrinsic
 
                 outputs = self.model(model_input)
-
-                # Extract detections
                 detections = self._extract_detections(outputs)
 
-                # Update tracker
-                self.tracker.update(detections)
+                # === Per-frame MOTA ===
+                if len(detections) > 0:
+                    pred_positions = np.array([[d.center[0], d.center[1]] for d in detections])
+                    pred_ids = np.arange(len(detections))
+                else:
+                    pred_positions = np.zeros((0, 2), dtype=np.float32)
+                    pred_ids = np.zeros((0,), dtype=np.int32)
 
-                # Get tracked positions
-                tracks = self.tracker.get_confirmed_tracks()
-                pred_positions = np.array([t.position for t in tracks]) if tracks else np.zeros((0, 2))
-                pred_ids = np.array([t.track_id for t in tracks]) if tracks else np.zeros((0,))
-
-                # Compute MOTA/MOTP
-                mota, motp, stats = compute_mota_motp(
-                    gt_positions, gt_ids,
-                    pred_positions, pred_ids
+                mota_pf, motp_pf, stats_pf = compute_mota_motp(
+                    gt_positions, gt_ids, pred_positions, pred_ids
                 )
-                all_stats.append(stats)
+                perframe_stats.append(stats_pf)
 
-                # Update progress bar
-                if batch_idx % 100 == 0:
+                # === Tracker-based MOTA（含自适应卡尔曼噪声）===
+                tracker.update(detections)
+                tracks = tracker.get_confirmed_tracks()
+                trk_positions = np.array([t.position for t in tracks]) if tracks else np.zeros((0, 2))
+                trk_ids = np.array([t.track_id for t in tracks]) if tracks else np.zeros((0,))
+
+                mota_trk, motp_trk, stats_trk = compute_mota_motp(
+                    gt_positions, gt_ids, trk_positions, trk_ids
+                )
+                tracker_stats.append(stats_trk)
+
+                if batch_idx % 50 == 0:
                     pbar.set_postfix({
-                        'MOTA': f'{mota:.3f}',
+                        'MOTA_pf': f'{mota_pf:.3f}',
                         'Dets': len(detections),
                         'Tracks': len(tracks)
                     })
 
-        # Compute overall metrics
-        overall_mota, overall_motp = accumulate_mota_stats(all_stats)
+        # === 结果汇总 ===
+        pf_mota, pf_motp = accumulate_mota_stats(perframe_stats)
+        trk_mota, trk_motp = accumulate_mota_stats(tracker_stats)
 
-        # Print detailed statistics
-        total_fp = sum(s['FP'] for s in all_stats)
-        total_fn = sum(s['FN'] for s in all_stats)
-        total_idsw = sum(s['IDSW'] for s in all_stats)
-        total_matches = sum(s['matches'] for s in all_stats)
-        total_gt = sum(s['num_gt'] for s in all_stats)
+        pf_fp = sum(s['FP'] for s in perframe_stats)
+        pf_fn = sum(s['FN'] for s in perframe_stats)
+        pf_idsw = sum(s['IDSW'] for s in perframe_stats)
+        pf_matches = sum(s['matches'] for s in perframe_stats)
+        pf_gt = sum(s['num_gt'] for s in perframe_stats)
+
+        trk_fp = sum(s['FP'] for s in tracker_stats)
+        trk_fn = sum(s['FN'] for s in tracker_stats)
+        trk_idsw = sum(s['IDSW'] for s in tracker_stats)
+        trk_matches = sum(s['matches'] for s in tracker_stats)
+        trk_gt = sum(s['num_gt'] for s in tracker_stats)
 
         print(f"\n{'='*60}")
-        print(f"Evaluation Results")
+        print(f"评估结果")
         print(f"{'='*60}")
-        print(f"Overall MOTA: {overall_mota:.4f}")
-        print(f"Overall MOTP: {overall_motp:.4f}")
-        print(f"\nDetailed Statistics:")
-        print(f"  Total GT: {total_gt}")
-        print(f"  Matches: {total_matches}")
-        print(f"  False Positives: {total_fp}")
-        print(f"  False Negatives: {total_fn}")
-        print(f"  ID Switches: {total_idsw}")
+        print(f"\n--- Per-frame MOTA ---")
+        print(f"  MOTA: {pf_mota:.4f}")
+        print(f"  MOTP: {pf_motp:.4f}")
+        print(f"  总GT: {pf_gt}")
+        print(f"  匹配: {pf_matches}")
+        print(f"  假阳性FP: {pf_fp}")
+        print(f"  假阴性FN: {pf_fn}")
+        print(f"  ID切换: {pf_idsw}")
+        print(f"\n--- Tracker-based MOTA（含自适应卡尔曼） ---")
+        print(f"  MOTA: {trk_mota:.4f}")
+        print(f"  MOTP: {trk_motp:.4f}")
+        print(f"  总GT: {trk_gt}")
+        print(f"  匹配: {trk_matches}")
+        print(f"  假阳性FP: {trk_fp}")
+        print(f"  假阴性FN: {trk_fn}")
+        print(f"  ID切换: {trk_idsw}")
         print(f"{'='*60}")
 
-        return overall_mota, overall_motp
+        return pf_mota, pf_motp
 
 
 def main():
-    # Configuration
     config = BaseConfig(
         data_root="/mnt/ourDataset_v2/ourDataset_v2_label",
         mapping_csv="/mnt/ourDataset_v2/mapping.csv",
@@ -197,13 +250,10 @@ def main():
         device='cuda'
     )
 
-    # Checkpoint path
-    checkpoint_path = './checkpoints/latest_model.pth'
+    # 使用v4最优模型评估
+    checkpoint_path = './checkpoints_v4/best_model.pth'
 
-    # Create evaluator
     evaluator = Evaluator(config, checkpoint_path)
-
-    # Evaluate
     evaluator.evaluate()
 
 

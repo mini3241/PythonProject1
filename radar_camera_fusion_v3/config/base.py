@@ -54,7 +54,7 @@ class BaseConfig:
 
     # Device configuration
     device: str = 'cuda'
-    cuda_visible_devices: str = '6'
+    cuda_visible_devices: str = '0'
 
     def __post_init__(self):
         """Post-initialization validation."""
