@@ -134,7 +134,7 @@ class KalmanTrack:
     """Kalman track with appearance features."""
     _next_id = 1
 
-    def __init__(self, x, y, n_init=2, max_age=5, delta_t=3, feature=None):
+    def __init__(self, x, y, n_init=1, max_age=5, delta_t=3, feature=None):
         self.kf = KalmanFilterFusion()
         self.mean, self.covariance = self.kf.initiate(x, y, orientation=0.0)
         self.track_id = KalmanTrack._next_id
@@ -193,7 +193,7 @@ class KalmanTrack:
         self.fusion_state = fusion_state
 
     def mark_missed(self):
-        if self.state == KalmanTrackState.Tentative:
+        if self.state == KalmanTrackState.Tentative and self.time_since_update > 3:
             self.state = KalmanTrackState.Deleted
         elif self.time_since_update > self.max_age:
             self.state = KalmanTrackState.Deleted
